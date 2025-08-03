@@ -39,13 +39,13 @@ class GRN(nn.Module):
         skip = self.skip(x)
         return out * gate + skip, mx.array(0.0, dtype=x.dtype) # 또는 mx.array(0.0) 등, main_loss와 호환되는 타입
     
-    def _forward(self, params, x):
-        # 함수형 스타일
-        # params는 self.parameters()와 동일한 구조의 딕셔너리
-        h = nn.elu(mx.matmul(x, params["fc1"]["w"].T) + params["fc1"]["b"])
-        out = mx.matmul(h, params["fc2"]["w"].T) + params["fc2"]["b"]
-        
-        gate = nn.sigmoid(mx.matmul(x, params["gate"]["w"].T) + params["gate"]["b"])
-        skip = mx.matmul(x, params["skip"]["w"].T)
-        
-        return out * gate + skip, mx.array(0.0, dtype=x.dtype)
+    @staticmethod
+    def functional_forward(x: mx.array, params: dict) -> mx.array:
+        """
+        함수형 경로: vmap에서 사용할 staticmethod.
+        """
+        h = nn.elu(Linear.functional_forward(x, params["fc1"]))
+        out = Linear.functional_forward(h, params["fc2"])
+        gate_val = nn.sigmoid(Linear.functional_forward(x, params["gate"]))
+        skip = Linear.functional_forward(x, params["skip"])
+        return out * gate_val + skip
