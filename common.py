@@ -221,8 +221,17 @@ class Linear(nn.Module):
         self.b = mx.random.uniform(low=-lim, high=lim, shape=(out_f,), dtype=dtype) if bias else mx.zeros((out_f,), dtype=dtype)
 
     def __call__(self, x:mx.array):
-        y = mx.matmul(x, self.w.T)
-        return y + self.b
+        return mx.matmul(x, self.w.T) + self.b
+    
+    @staticmethod
+    def functional_forward(x: mx.array, params: dict) -> mx.array:
+        """
+        vmap과 같은 함수 변환을 위한 '함수형 경로'.
+        params 딕셔너리에서 가중치와 편향을 명시적으로 받아 사용.
+        """
+        # params 딕셔너리는 __init__에서 'bias_vector'를 항상 생성하므로,
+        # .get() 없이 직접 접근 가능
+        return mx.matmul(x, params['w'].T) + params['b']
 
 class RMSNorm(nn.Module):
     """
@@ -294,3 +303,18 @@ def apply_rope(x: mx.array, freqs: mx.array):
     rotated_i = x_r * freqs_sin + x_i * freqs_cos
 
     return mx.concatenate([rotated_r, rotated_i], axis=-1)
+
+def one_hot(indices: mx.array, num_classes: int, dtype: mx.Dtype = mx.float32) -> mx.array:
+    """
+    MLX에서 one-hot 인코딩을 수행하는 함수.
+
+    Args:
+        indices (mx.array): 정수형 라벨(인덱스)을 담고 있는 배열.
+        num_classes (int): 총 클래스의 수. 원-핫 벡터의 길이가 됩니다.
+        dtype (mx.Dtype, optional): 출력 텐서의 데이터 타입.
+
+    Returns:
+        mx.array: 원-핫 인코딩된 배열. shape은 (*indices.shape, num_classes)가 됩니다.
+    """
+    # broadcasting을 활용한 효율적인 one-hot 인코딩
+    return (indices[..., None] == mx.arange(num_classes)).astype(dtype)

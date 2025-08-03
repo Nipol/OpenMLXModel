@@ -72,8 +72,7 @@ class LatentAttentionTrain(nn.Module):
         self.head_dim = d // n_h
         self.scale = self.head_dim ** -0.5
         self.rope = rope
-        
-        self.attn_dropout = nn.Dropout(dropout)
+
         self.resid_dropout = nn.Dropout(dropout)
         
         self.qk_rope_head_dim = self.head_dim // 2
@@ -134,22 +133,21 @@ class LatentAttentionTrain(nn.Module):
         # 4. Q, K 재구성
         query_states = mx.concatenate([q_nope, q_pe], axis=-1)
         key_states = mx.concatenate([k_nope, k_pe], axis=-1)
-        
-        # 5. KV 캐싱 (추론 시) - 생략
 
-        # [!!!] GQA/MQA를 위한 헤드 반복
+        # GQA/MQA Style을 위한 헤드 반복
         if self.num_kv_heads != self.num_heads:
             repeats = self.num_heads // self.num_kv_heads
             key_states = mx.repeat(key_states, repeats, axis=1)
             v = mx.repeat(v, repeats, axis=1)
 
         # 6. 어텐션 계산
-        attn_scores = (query_states @ key_states.transpose(0, 1, 3, 2)) * self.scale
-        attn_scores = attn_scores + mask
-        attn_weights = mx.softmax(attn_scores.astype(mx.float32), axis=-1).astype(x.dtype)
-        attn_weights = self.attn_dropout(attn_weights)
-        
-        attn_output = attn_weights @ v
+        attn_output = mx.fast.scaled_dot_product_attention(
+            query_states, 
+            key_states, 
+            v, 
+            scale=self.scale, 
+            mask=mask
+        )
 
         # 7. 최종 출력
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(batch, seq_len, -1)
