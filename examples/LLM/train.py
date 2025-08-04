@@ -291,7 +291,7 @@ if __name__ == "__main__":
 
     start_step = 0
     if args.resume:
-        start_step = load_ckpt(model, optimizer, pathlib.Path(args.resume))
+        start_step = load_ckpt(model, optimizer, pathlib.Path(args.ckpt_dir) / args.resume)
 
     if args.train_steps and args.data_dir:
         tbin = pathlib.Path(args.data_dir)/"train.bin"; vbin = pathlib.Path(args.data_dir)/"val.bin"
