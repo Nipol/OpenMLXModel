@@ -37,7 +37,7 @@ class GRN(nn.Module):
         out = self.fc2(nn.elu(self.fc1(x)))
         gate = nn.sigmoid(self.gate(x))
         skip = self.skip(x)
-        return out * gate + skip, mx.array(0.0, dtype=x.dtype) # 또는 mx.array(0.0) 등, main_loss와 호환되는 타입
+        return out * gate + skip
     
     @staticmethod
     def functional_forward(x: mx.array, params: dict) -> mx.array:
