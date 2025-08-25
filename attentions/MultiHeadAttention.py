@@ -19,7 +19,6 @@ import mlx.nn as nn
 from common import (
     Linear,
     apply_rope,
-    sliding_window_causal_mask
 )
 
 class MultiHeadAttentionTrain(nn.Module):
@@ -57,23 +56,28 @@ class MultiHeadAttentionTrain(nn.Module):
         self.n_h, self.hd = n_h, d//n_h
         self.scale = self.hd ** -0.5
         self.rope = rope
-        self.q = Linear(d, d, bias=use_bias, dtype=dtype)
-        self.k = Linear(d, d, bias=use_bias, dtype=dtype)
-        self.v = Linear(d, d, bias=use_bias, dtype=dtype)
-        self.o = Linear(d, d, bias=use_bias, dtype=dtype)
-
-    def _split(self, x):
-        b, t, _ = x.shape
-        return x.reshape(b, t, self.n_h, self.hd).transpose(0,2,1,3)
+        # Q, K, V 프로젝션을 하나의 Linear 레이어로 통합
+        self.qkv_proj = Linear(d, 3 * d, bias=use_bias, dtype=dtype)
+        self.o_proj = Linear(d, d, bias=use_bias, dtype=dtype)
 
     def __call__(self, x, mask=None):
-        q = self._split(self.q(x))
-        k = self._split(self.k(x))
-        v = self._split(self.v(x))
+        # 1. 단일 matmul로 q, k, v를 한 번에 계산
+        qkv = self.qkv_proj(x)
+        
+        # 2. 마지막 차원에서 q, k, v로 분리
+        # qkv: (B, S, 3*d) -> q,k,v 각각 (B, S, d)
+        d = self.n_h * self.hd
+        q, k, v = mx.split(qkv, 3, axis=-1)
+
+        # 3. 헤드로 분할 (이 부분은 동일)
+        q = q.reshape(x.shape[0], x.shape[1], self.n_h, self.hd).transpose(0,2,1,3)
+        k = k.reshape(x.shape[0], x.shape[1], self.n_h, self.hd).transpose(0,2,1,3)
+        v = v.reshape(x.shape[0], x.shape[1], self.n_h, self.hd).transpose(0,2,1,3)
+
         freqs = self.rope[:q.shape[2]]
         q, k = apply_rope(q, freqs), apply_rope(k, freqs)
         y = mx.fast.scaled_dot_product_attention(q, k, v, mask=mask, scale=self.scale)
-        return self.o(y.transpose(0,2,1,3).reshape(x.shape))
+        return self.o_proj(y.transpose(0,2,1,3).reshape(x.shape))
 
 class MultiHeadAttentionInfer(nn.Module):
     """
@@ -113,25 +117,34 @@ class MultiHeadAttentionInfer(nn.Module):
         self.n_h, self.hd = n_h, d//n_h
         self.scale = self.hd ** -0.5
         self.rope = rope
-        self.q = Linear(d, d, bias=use_bias, dtype=dtype)
-        self.k = Linear(d, d, bias=use_bias, dtype=dtype)
-        self.v = Linear(d, d, bias=use_bias, dtype=dtype)
-        self.o = Linear(d, d, bias=use_bias, dtype=dtype)
+        # Q, K, V 프로젝션을 하나의 Linear 레이어로 통합
+        self.qkv_proj = Linear(d, 3 * d, bias=use_bias, dtype=dtype)
+        self.o_proj = Linear(d, d, bias=use_bias, dtype=dtype)
 
     def _split(self, x):
         b, t, _ = x.shape
         return x.reshape(b, t, self.n_h, self.hd).transpose(0,2,1,3)
 
     def __call__(self, x, cache, mask):
-        q = self._split(self.q(x))   # (B, n_h, 1, hd)
-        k_new = self._split(self.k(x)) # (B, n_h, 1, hd)
-        v_new = self._split(self.v(x)) # (B, n_h, 1, hd)
-        freqs = self.rope[:, :q.shape[-1]]
-        q = apply_rope(q, freqs)
-        k_new = apply_rope(k_new, freqs)
+        # 1. 단일 matmul로 q, k, v를 한 번에 계산
+        qkv = self.qkv_proj(x)
+        
+        # 2. 마지막 차원에서 q, k, v로 분리
+        # qkv: (B, S, 3*d) -> q,k,v 각각 (B, S, d)
+        d = self.n_h * self.hd
+        q, k, v = mx.split(qkv, 3, axis=-1)
+
+        # 3. 헤드로 분할 (이 부분은 동일)
+        q = q.reshape(x.shape[0], x.shape[1], self.n_h, self.hd).transpose(0,2,1,3)
+        k = k.reshape(x.shape[0], x.shape[1], self.n_h, self.hd).transpose(0,2,1,3)
+        v = v.reshape(x.shape[0], x.shape[1], self.n_h, self.hd).transpose(0,2,1,3)
+
+        freqs = self.rope[:q.shape[2]]
+        q, k = apply_rope(q, freqs), apply_rope(k, freqs)
+
         # 캐시 누적 (k/v) → (B, n_h, S_total, hd)
-        k = mx.concatenate([cache['k'], k_new], axis=2)
-        v = mx.concatenate([cache['v'], v_new], axis=2)
+        k = mx.concatenate([cache['k'], k], axis=2)
+        v = mx.concatenate([cache['v'], v], axis=2)
         cache['k'], cache['v'] = k, v  # in-place 갱신
         y = mx.fast.scaled_dot_product_attention(q, k, v, mask=mask, scale=self.scale)
-        return self.o(y.transpose(0,2,1,3).reshape(x.shape))
+        return self.o_proj(y.transpose(0,2,1,3).reshape(x.shape))
