@@ -16,10 +16,12 @@
 ###############################################################################
 import mlx.core as mx
 import mlx.nn as nn
+from typing import Tuple
 from common import (
     Linear,
     RMSNorm,
     apply_rope,
+    rope_cache,
 )
 
 class LatentAttentionTrain(nn.Module):
@@ -107,8 +109,7 @@ class LatentAttentionTrain(nn.Module):
 
         # 1. Q 프로젝션 (n_h개 헤드)
         q_lora = self.q_a_layernorm(self.q_a_proj(x))
-        q = self.q_b_proj(q_lora)
-        q = q.reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = self.q_b_proj(q_lora).reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         q_nope, q_pe = mx.split(q, [self.qk_nope_head_dim], axis=-1)
 
         # 2. KV 프로젝션 (n_kv개 헤드)
@@ -172,7 +173,6 @@ class LatentAttentionInfer(nn.Module):
         use_bias (bool): 프로젝션 레이어 bias 사용 여부.
         q_lora_rank (int): Q LoRA 차원.
         kv_lora_rank (int): KV LoRA 차원.
-        dropout (float): 드롭아웃 확률 (실전 Serving시엔 0 권장).
         dtype: 파라미터 데이터 타입.
 
     입력:
@@ -198,98 +198,145 @@ class LatentAttentionInfer(nn.Module):
       - RoPE, LayerNorm, LoRA 구조는 학습용과 동일.
     """
     def __init__(self, d: int, n_h: int, n_kv: int, rope: mx.array, use_bias: bool,
-                 q_lora_rank: int = 64, kv_lora_rank: int = 64, dropout: float = 0.0, dtype=mx.float32):
+                 q_lora_rank: int = 64, kv_lora_rank: int = 64, dtype=mx.float32):
         super().__init__()
         self.num_heads = n_h
         self.num_kv_heads = n_kv
         self.head_dim = d // n_h
         self.scale = self.head_dim ** -0.5
-        self.rope = rope
+        self.rope = rope # (max_seq_len, qk_rope_head_dim * 2)
 
+        self.qk_rope_head_dim = self.head_dim // 2
+        self.qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
+        self.v_head_dim = self.head_dim
+        
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
 
-        self.q_a_proj = Linear(d, q_lora_rank, bias=use_bias, dtype=dtype)
-        self.q_a_layernorm = RMSNorm(q_lora_rank)
-        self.q_b_proj = Linear(q_lora_rank, n_h * self.head_dim, bias=use_bias, dtype=dtype)
+        self.q_a_proj = Linear(d, self.q_lora_rank, bias=use_bias, dtype=dtype)
+        self.q_a_layernorm = RMSNorm(self.q_lora_rank)
+        self.q_b_proj = Linear(self.q_lora_rank, self.num_heads * self.head_dim, bias=use_bias, dtype=dtype)
 
-        self.kv_a_proj_with_rope = Linear(d, kv_lora_rank + n_kv * (self.head_dim // 2), bias=use_bias, dtype=dtype)
-        self.kv_a_layernorm = RMSNorm(kv_lora_rank)
-        self.kv_b_proj = Linear(kv_lora_rank, n_kv * (self.head_dim // 2 + self.head_dim), bias=use_bias, dtype=dtype)
+        self.kv_a_proj_with_rope = Linear(d, self.kv_lora_rank + self.num_kv_heads * self.qk_rope_head_dim, bias=use_bias, dtype=dtype)
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank)
+        self.kv_b_proj = Linear(self.kv_lora_rank, self.num_kv_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=use_bias, dtype=dtype)
+        
+        self.o_proj = Linear(self.num_heads * self.v_head_dim, d, bias=use_bias, dtype=dtype)
 
-        self.o_proj = Linear(n_h * self.head_dim, d, bias=use_bias, dtype=dtype)
+    def __call__(self, x: mx.array, cache: Tuple[mx.array, mx.array], start_pos: int, mask: mx.array = None):
+        B, S, _ = x.shape
+        key_cache, value_cache = cache
 
-    def __call__(self, x: mx.array, cache: dict, mask: mx.array):
-        batch, seq_len, _ = x.shape
+        # print("\n--- [Debug] LatentAttentionInfer.__call__ ---")
+        # print(f"Input x shape: (B={B}, S={S}, D={x.shape[-1]})")
+        # print(f"Received key_cache shape: {key_cache.shape}")
+        # print(f"Received start_pos: {start_pos}")
 
-        # Q 프로젝션
+        # 1. 프로젝션
         q_lora = self.q_a_layernorm(self.q_a_proj(x))
-        q = self.q_b_proj(q_lora)
-        q = q.reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        q_nope, q_pe = mx.split(q, [self.head_dim // 2], axis=-1)
-
-        # KV 프로젝션
+        q = self.q_b_proj(q_lora).reshape(B, S, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        # print(f"  > q (after proj) shape: {q.shape}")
+        
         kv_a_output = self.kv_a_proj_with_rope(x)
         kv_lora_compressed, k_pe_unshaped = mx.split(kv_a_output, [self.kv_lora_rank], axis=-1)
         kv_intermediate = self.kv_a_layernorm(kv_lora_compressed)
-        kv = self.kv_b_proj(kv_intermediate)
-        # K_nope, V 분리
-        kv = kv.reshape(batch, seq_len, self.num_kv_heads, self.head_dim // 2 + self.head_dim).transpose(0,2,1,3)
-        k_nope, v = mx.split(kv, [self.head_dim // 2], axis=-1)
-        # K_pe 분리
-        k_pe = k_pe_unshaped.reshape(batch, seq_len, self.num_kv_heads, self.head_dim // 2).transpose(0,2,1,3)
+        kv = self.kv_b_proj(kv_intermediate).reshape(B, S, self.num_kv_heads, self.qk_nope_head_dim + self.v_head_dim).transpose(0, 2, 1, 3)
+        k_nope, values = mx.split(kv, [self.qk_nope_head_dim], axis=-1)
+        k_pe_unrotated = k_pe_unshaped.reshape(B, S, self.num_kv_heads, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
+        # print(f"  > values (after proj) shape: {values.shape}")
+        # print(f"  > keys (nope part) shape: {k_nope.shape}")
+        # print(f"  > keys (pe part) shape: {k_pe_unrotated.shape}")
 
-        # RoPE 적용
-        freqs = self.rope[:seq_len, :self.head_dim // 2]
-        q_pe = apply_rope(q_pe, freqs)
-        k_pe = apply_rope(k_pe, freqs)
+        # 2. RoPE 적용
+        # freqs = self.rope[start_pos : start_pos + S, :]
+        q_nope, q_pe_unrotated = mx.split(q, [self.qk_nope_head_dim], axis=-1)
+        # self.rope 테이블 (너비: D_head)에서,
+        # RoPE가 적용될 부분(너비: qk_rope_head_dim)만큼만 잘라냅니다.
+        freqs = self.rope[start_pos : start_pos + S, :self.qk_rope_head_dim]
+        # print(f"  > Sliced freqs shape: {freqs.shape}")
+        
+        q_pe_rotated = apply_rope(q_pe_unrotated, freqs)
+        k_pe_rotated = apply_rope(k_pe_unrotated, freqs)
+        
+        queries = mx.concatenate([q_nope, q_pe_rotated], axis=-1)
+        keys = mx.concatenate([k_nope, k_pe_rotated], axis=-1)
+        # print(f"  > final queries (after RoPE) shape: {queries.shape}")
+        # print(f"  > final keys (after RoPE) shape: {keys.shape}")
 
-        # Q/K 재결합
-        query_states = mx.concatenate([q_nope, q_pe], axis=-1)
-        key_states = mx.concatenate([k_nope, k_pe], axis=-1)
+        # 3. [★★핵심 수정★★] 캐시 업데이트 (수동 재구성)
+        # 캐시의 세 부분으로 나눔: 업데이트 전, 업데이트 될 부분, 업데이트 후
+        pre_slice_k = key_cache[:, :, :start_pos, :]
+        post_slice_k = key_cache[:, :, start_pos + S:, :]
+        
+        pre_slice_v = value_cache[:, :, :start_pos, :]
+        post_slice_v = value_cache[:, :, start_pos + S:, :]
+        
+        # 세 부분을 다시 합쳐서 새로운 캐시 텐서 생성
+        new_key_cache = mx.concatenate([pre_slice_k, keys, post_slice_k], axis=2)
+        new_value_cache = mx.concatenate([pre_slice_v, values, post_slice_v], axis=2)
+        # print(f"  > new_key_cache shape: {new_key_cache.shape}")
 
-        # KV 캐시 누적
-        k_new = key_states
-        v_new = v
-        if 'k' not in cache:
-            k = k_new
-            v = v_new
-        else:
-            k = mx.concatenate([cache['k'], k_new], axis=2)
-            v = mx.concatenate([cache['v'], v_new], axis=2)
-        cache['k'] = k
-        cache['v'] = v
-
-        # GQA/MQA: KV헤드와 쿼리헤드 개수가 다르면 반복
+        # 4. 어텐션 계산 준비
+        final_keys_len = start_pos + S
+        final_keys = new_key_cache[:, :, :final_keys_len, :]
+        final_values = new_value_cache[:, :, :final_keys_len, :]
+        # print(f"  > final_keys for attention shape: {final_keys.shape}")
+        
         if self.num_kv_heads != self.num_heads:
-            repeats = self.num_heads // self.num_kv_heads
-            k = mx.repeat(k, repeats, axis=1)
-            v = mx.repeat(v, repeats, axis=1)
+            final_keys = mx.repeat(final_keys, self.num_heads // self.num_kv_heads, axis=1)
+            final_values = mx.repeat(final_values, self.num_heads // self.num_kv_heads, axis=1)
 
-        # 어텐션 계산 (scaled dot product)
-        attn_scores = (query_states @ k.transpose(0, 1, 3, 2)) * self.scale
-        # attn_scores의 shape (B, H, S_q, S_kv)
-        # m의 shape (1, 1, S_kv_mask, S_kv_mask)
+        # 5. 어텐션 계산
+        attn_output = mx.fast.scaled_dot_product_attention(queries, final_keys, final_values, scale=self.scale, mask=mask)
+        output = self.o_proj(attn_output.transpose(0, 2, 1, 3).reshape(B, S, -1))
         
-        # 현재 쿼리 시퀀스 길이에 맞는 부분만 마스크에서 잘라내어 사용
-        s_q = query_states.shape[2]
-        s_kv = key_states.shape[2]
-        
-        # 외부에서 전달된 마스크 m의 전체 크기
-        mask_len = mask.shape[-1]
-        
-        # 마스크에서 필요한 부분만 잘라냅니다.
-        # 쿼리는 항상 시퀀스의 마지막 부분을 나타내므로,
-        # 마스크의 마지막 s_q개의 행을 사용합니다.
-        # 키는 전체 캐시된 시퀀스를 나타내므로,
-        # 마스크의 첫 s_kv개의 열을 사용합니다.
-        sliced_mask = mask[:, :, -s_q:, :s_kv]
-        attn_scores = attn_scores + sliced_mask
+        # print(f"  > Final output shape: {output.shape}")
+        return output, (new_key_cache, new_value_cache)
 
-        attn_weights = mx.softmax(attn_scores.astype(x.dtype), axis=-1)
-        attn_output = attn_weights @ v
+# --- 로직 검증 테스트 (최종) ---
+if __name__ == '__main__':
+    B, S_max, D = 1, 128, 64
+    H, H_kv = 4, 2
+    Q_LORA, KV_LORA = 16, 16
+    D_head = D // H
+    qk_rope_head_dim = D_head // 2
+    DTYPE = mx.float32
+    
+    print("LatentAttentionInfer 최종 로직 검증 테스트 (Shape 일치)")
+    
+    # [★★핵심 수정★★] rope_table을 qk_rope_head_dim 차원으로 생성
+    rope_table = rope_cache(S_max, qk_rope_head_dim, dtype=DTYPE)
+    print(f"생성된 RoPE 테이블 shape: {rope_table.shape}")
+    
+    model = LatentAttentionInfer(d=D, n_h=H, n_kv=H_kv, rope=rope_table, use_bias=True, q_lora_rank=Q_LORA, kv_lora_rank=KV_LORA, dtype=DTYPE)
+    mx.eval(model.parameters())
+    
+    key_cache = mx.zeros((B, H_kv, S_max, D_head), dtype=DTYPE)
+    value_cache = mx.zeros((B, H_kv, S_max, D_head), dtype=DTYPE)
+    
+    print("\n[Step 1] Prefill 단계 테스트")
+    prompt_len = 10
+    prompt_tokens = mx.random.normal(shape=(B, prompt_len, D))
+    
+    # Prefill 시 start_pos=0
+    output_prefill, caches_after_prefill = model(prompt_tokens, (key_cache, value_cache), 0)
+    mx.eval(output_prefill, caches_after_prefill[0])
+    
+    print(f"  Prefill 후 Key 캐시 shape: {caches_after_prefill[0].shape}")
+    assert mx.sum(caches_after_prefill[0][:, :, :prompt_len, :]).item() != 0
+    print("  ✅ Prefill 단계 검증 통과!")
 
-        # 최종 출력 (B, 1, d)
-        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(batch, seq_len, -1)
-        output = self.o_proj(attn_output)
-        return output
+    print("\n[Step 2] Decode 단계 테스트")
+    current_caches = caches_after_prefill
+    current_pos = prompt_len
+    
+    single_token = mx.random.normal(shape=(B, 1, D))
+    # Decode 시 start_pos=current_pos
+    output_decode, current_caches = model(single_token, current_caches, current_pos)
+    mx.eval(output_decode, current_caches[0])
+    
+    print(f"  Decode 후 Key 캐시 shape: {current_caches[0].shape}")
+    assert mx.sum(current_caches[0][:, :, current_pos:current_pos+1, :]).item() != 0
+    print("  ✅ Decode 단계 검증 통과!")
+    
+    print("\n🎉 모든 검증을 통과했습니다.")
