@@ -271,38 +271,48 @@ class LayerScale(nn.Module):
     def __call__(self,x):
         return x*self.s
 
-def rope_cache(seq:int, d:int, base:int=10_000, dtype=mx.float32):
-    half=d//2
-    inv=1.0/(base**(mx.arange(half)/half))
-    t=mx.arange(seq)[:,None]
-    freqs=t*inv[None]
-    return mx.concat([mx.cos(freqs),mx.sin(freqs)],-1).astype(dtype)
-
-@mx.compile
-def apply_rope(x: mx.array, freqs: mx.array):
+def rope_cache(seq_len: int, rope_dims: int, base: int = 10_000, dtype=mx.float32) -> mx.array:
     """
-    주어진 주파수(freqs)를 사용하여 입력 텐서(x)에 RoPE를 적용합니다.
-    이 함수는 입력 x와 freqs의 마지막 차원 크기가 동일하다고 가정합니다.
-
-    Args:
-        x (mx.array): RoPE를 적용할 텐서. Shape: (..., seq_len, rope_dim)
-        freqs (mx.array): RoPE 주파수 텐서. Shape: (seq_len, rope_dim)
-
-    Returns:
-        mx.array: RoPE가 적용된 텐서.
+    인터리빙된 (cos, sin) RoPE 테이블을 생성합니다.
     """
-    # 입력 텐서와 주파수 텐서를 실수부/허수부로 분리
-    x_r, x_i = mx.split(x, 2, axis=-1)
-    freqs_cos, freqs_sin = mx.split(freqs, 2, axis=-1)
-
-    # 브로드캐스팅을 위해 freqs의 차원을 확장 (예: (S, D/2) -> (1, 1, S, D/2))
-    # MLX의 자동 브로드캐스팅이 대부분의 경우 처리해 줍니다.
+    if rope_dims % 2 != 0:
+        raise ValueError(f"RoPE 차원(rope_dims)은 짝수여야 합니다. 현재 값: {rope_dims}")
+        
+    half_dims = rope_dims // 2
+    theta = 1.0 / (base**(mx.arange(0, half_dims, dtype=mx.float32) / half_dims))
+    t = mx.arange(seq_len, dtype=mx.float32)
+    freqs = mx.outer(t, theta)
     
-    # 복소수 곱셈을 사용한 회전 변환: (x_r + i*x_i) * (cos + i*sin)
-    rotated_r = x_r * freqs_cos - x_i * freqs_sin
-    rotated_i = x_r * freqs_sin + x_i * freqs_cos
+    cos_freqs = mx.cos(freqs)
+    sin_freqs = mx.sin(freqs)
+    
+    freqs_interleaved = mx.stack([cos_freqs, sin_freqs], axis=-1).reshape(seq_len, rope_dims)
+    
+    return freqs_interleaved.astype(dtype)
 
-    return mx.concatenate([rotated_r, rotated_i], axis=-1)
+def apply_rope(x: mx.array, freqs: mx.array) -> mx.array:
+    """
+    짝/홀수 인덱싱 기반의 수학적으로 정확한 RoPE 구현.
+    수치 안정성을 위해 내부 연산은 float32로 수행하고, 원래 타입으로 복원.
+    """
+    original_dtype = x.dtype
+    x_f32 = x.astype(mx.float32)
+    freqs_f32 = freqs.astype(mx.float32)
+    
+    x1 = x_f32[..., 0::2]
+    x2 = x_f32[..., 1::2]
+    
+    freqs_cos = freqs_f32[..., 0::2]
+    freqs_sin = freqs_f32[..., 1::2]
+    
+    rotated_x1 = x1 * freqs_cos - x2 * freqs_sin
+    rotated_x2 = x2 * freqs_cos + x1 * freqs_sin
+    
+    output = mx.zeros_like(x_f32)
+    output[..., 0::2] = rotated_x1
+    output[..., 1::2] = rotated_x2
+    
+    return output.astype(original_dtype)
 
 def one_hot(indices: mx.array, num_classes: int, dtype: mx.Dtype = mx.float32) -> mx.array:
     """
