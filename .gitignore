@@ -1,6 +1,10 @@
 *_ckpts/
 *.bin
 .DS_Store
+test_*.py
+*.safetensors
+*.json
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
