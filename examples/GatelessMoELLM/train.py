@@ -114,7 +114,7 @@ class LLMMini(nn.Module):
     def __call__(self, ids, labels: mx.array, m=None):
         x, _ = self.embed(ids)
 
-        for _, b in enumerate(self.blocks):
+        for b in self.blocks:
             x = b(x, labels, m)
 
         x_norm = self.norm(x)
@@ -240,7 +240,6 @@ def train(model, optimizer, steps:int, lr:float, batch:int, train_iter, val_iter
         "model": model,
     }
 
-    # [1. 컴파일된 학습 스텝]
     # 이전과 마찬가지로, Metal 버그 회피를 위해 클리핑/업데이트는 제외합니다.
     # @partial(mx.compile, inputs=train_state, outputs=train_state["model"])
     def compiled_train_loss_and_grad(x, y, labels):
@@ -254,7 +253,6 @@ def train(model, optimizer, steps:int, lr:float, batch:int, train_iter, val_iter
         loss, grads = value_and_grad_fn(train_state["model"], x, y, labels)
         return loss, grads
 
-    # [2. 컴파일된 평가 스텝]
     # 평가 시에는 그래디언트가 필요 없으므로, loss 계산만 컴파일합니다.
     # @partial(mx.compile, inputs=eval_state, outputs=eval_state["model"])
     def compiled_eval_loss(x, y, labels):

@@ -20,6 +20,7 @@ import argparse, pathlib, json
 import argparse
 import json
 import pathlib
+from typing import Tuple, List
 
 from attentions.LatentAttention import LatentAttentionInfer
 from ffns.GRNFFN import GRN
@@ -47,12 +48,14 @@ class Block(nn.Module):
         self.attn = LatentAttentionInfer(d, nh, nkv, r, use_bias, dtype = dtype)
         self.ffn = GRN(d, f, use_bias, dtype = dtype)
 
-    def __call__(self, x, c, m):
-        x = x + self.R1(self.attn(self.n1(x), c, m))
+    def __call__(self, x, cache, start_pos, m=None):
+        attn_out, new_cache = self.attn(self.n1(x), cache, start_pos, m)
+        x = x + self.R1(attn_out)
+
         normed_x = self.n2(x)
-        ffn_output, aux_loss = self.ffn(normed_x)
+        ffn_output, _ = self.ffn(normed_x)
         x = x + self.R2(ffn_output)
-        return x, aux_loss
+        return x, new_cache
 
 class LLMMini(nn.Module):
     """
@@ -66,16 +69,36 @@ class LLMMini(nn.Module):
         self.norm=RMSNorm(d, dtype = dtype)
         self.lm_head=Linear(d, vocab, bias=False, dtype=dtype)
         self.lm_head.weight=self.embed.tok.weight
-        self.cache = [{} for _ in range(layers)]
 
-    def __call__(self, ids, m=None):
+    def __call__(self, ids, caches: List[Tuple[mx.array, mx.array]], start_pos: int, mask=None):
         x, _ = self.embed(ids)
+
+        new_caches = []
         for i, b in enumerate(self.blocks):
-            x, _ = b(x, c=self.cache[i], m=m)
+            # [수정] i번째 블록에 i번째 캐시와 start_pos 전달
+            x, new_block_cache = b(x, caches[i], start_pos, mask)
+            new_caches.append(new_block_cache)
+
         x_norm = self.norm(x)
         logits = self.lm_head(x_norm)
-        return logits
-
+        return logits, new_caches
+    
+    def init_caches(self, inputs):
+        """추론을 시작하기 전에 캐시를 초기화하는 헬퍼 함수"""
+        # 이 함수는 generate 시작 시 한 번만 호출
+        B, S = inputs.shape
+        # ... (각 LatentAttention 레이어의 KV shape에 맞게 0으로 채워진 텐서 생성)
+        # 예시:
+        d_k = self.blocks[0].attn.head_dim
+        n_kv = self.blocks[0].attn.num_kv_heads
+        max_len = self.blocks[0].attn.rope.shape[0] # rope 테이블의 최대 길이
+        
+        self.current_pos = 0
+        self.caches = []
+        for _ in self.blocks:
+            key_cache = mx.zeros((B, n_kv, max_len, d_k), dtype=self.embed.tok.weight.dtype)
+            value_cache = mx.zeros((B, n_kv, max_len, d_k), dtype=self.embed.tok.weight.dtype)
+            self.caches.append((key_cache, value_cache))
 
 def sample(logits: mx.array, temp: float = 1.0, top_p: float = 0.9):
     """
@@ -106,7 +129,7 @@ def sample(logits: mx.array, temp: float = 1.0, top_p: float = 0.9):
     return mx.random.categorical(mx.log(probs))
 
 def generate(
-    model: LLMMini, # 임포트한 모델 클래스 이름과 일치시켜야 함
+    model: LLMMini,
     tokenizer,
     prompt: str,
     max_tokens: int = 100,
@@ -117,20 +140,35 @@ def generate(
     프롬프트를 기반으로 텍스트를 생성합니다. (KV 캐시 적용 버전)
     """
     print(f"Prompt: {prompt}", end="", flush=True)
+
+    # 1. 캐시 및 상태 초기화
+    # 모델의 최대 시퀀스 길이에 맞춰 0으로 채워진 캐시를 미리 할당
+    B = 1
+    S_max = model.blocks[0].attn.rope.shape[0]
+    n_kv = model.blocks[0].attn.num_kv_heads
+    d_head = model.blocks[0].attn.head_dim
+    dtype = model.embed.tok.weight.dtype
+
+    caches = []
+    for _ in model.blocks:
+        key_cache = mx.zeros((B, n_kv, S_max, d_head), dtype=dtype)
+        value_cache = mx.zeros((B, n_kv, S_max, d_head), dtype=dtype)
+        caches.append((key_cache, value_cache))
     
-    # 1. 프롬프트를 토큰화하고 모델에 입력 (Prefill 단계)
+    current_pos = 0
+
+    # Prefill 단계
     prompt_tokens = mx.array([tokenizer.encode(prompt)])
-    # 프롬프트 길이만큼 마스크 생성
-    seq_len = prompt_tokens.shape[1]
-    mask = causal_mask(seq_len, dtype=mx.bfloat16)
+    S_prompt = prompt_tokens.shape[1]
     
-    # 맨 처음에는 전체 프롬프트에 대한 logits과 KV 캐시를 생성합니다.
-    # 이 단계에서 KV 캐시는 모든 블록에 대해 채워집니다.
-    y = model(prompt_tokens, m=mask)
+    # Prefill 시에는 causal_mask가 필요
+    mask = causal_mask(S_prompt, dtype=dtype)
     
-    # 마지막 토큰의 로짓만 사용하여 첫 번째 새로운 토큰을 샘플링합니다.
-    last_token_logits = y[:, -1, :]
-    next_token = sample(last_token_logits, temp, top_p)
+    # 모델에 (토큰, 캐시, 시작 위치, 마스크) 전달
+    y, caches = model(prompt_tokens, caches, current_pos, mask)
+    current_pos += S_prompt
+    
+    next_token = sample(y[:, -1, :], temp, top_p)
     
     # 생성된 토큰을 즉시 디코딩하여 출력
     token_text = tokenizer.decode(next_token.tolist())
@@ -141,12 +179,10 @@ def generate(
     #    - KV 캐시는 각 블록의 __call__ 메소드 내에서 자동으로 관리됩니다.
     for i in range(max_tokens - 1):
         # 모델에 이전에 생성된 '단일' 토큰을 입력합니다.
-        y = model(next_token.reshape(1, 1), m=mask)
+        y, caches = model(next_token.reshape(1, 1), caches, current_pos, mask=None)
+        current_pos += 1
         
-        # 모델 출력은 항상 (B, S, V) 형태이므로, S=1인 로짓을 가져옵니다.
         logits = y[:, -1, :]
-        
-        # 다음 토큰 샘플링
         next_token = sample(logits, temp, top_p)
 
         # 생성된 토큰을 즉시 디코딩하여 출력
@@ -159,7 +195,7 @@ def generate(
 
     print("\n\n[Done]")
 
-# PYTHONPATH=. uv run examples/LLM/llmgenerate.py --resume llm_ckpts/ckpt_001000.json --prompt "The secret to happiness is"
+# PYTHONPATH=. uv run examples/LLM/generate.py --resume llm_ckpts/ckpt_001000.json --prompt "행복의 비밀은 "
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate text from a trained model.")
     parser.add_argument(

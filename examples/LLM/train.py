@@ -19,10 +19,9 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 import tiktoken
 import numpy as np # only for data Loader
-import math, argparse, os, sys, time, pathlib, random, json
+import math, argparse, sys, pathlib, json
 
-from typing import Dict, Tuple, Optional
-from functools import partial
+from typing import Dict, Tuple
 from mlx.utils import tree_unflatten, tree_flatten, tree_map
 from attentions.LatentAttention import LatentAttentionTrain
 from ffns.GRNFFN import GRN
@@ -49,9 +48,9 @@ class Block(nn.Module):
     def __call__(self, x, m):
         x = x + self.R1(self.attn(self.n1(x), m))
         normed_x = self.n2(x)
-        ffn_output, aux_loss = self.ffn(normed_x)
+        ffn_output = self.ffn(normed_x)
         x = x + self.R2(ffn_output)
-        return x, aux_loss # 튜플 반환
+        return x
     
 class LLMMini(nn.Module):
     """
@@ -68,15 +67,13 @@ class LLMMini(nn.Module):
 
     def __call__(self, ids, m=None):
         x, _ = self.embed(ids)
-        total_aux_loss = mx.array(0.0, dtype=x.dtype)
 
-        for _, b in enumerate(self.blocks):
-            x, aux_loss = b(x, m)
-            total_aux_loss += aux_loss
+        for b in self.blocks:
+            x = b(x, m)
             
         x_norm = self.norm(x)
         logits = self.lm_head(x_norm)
-        return logits, total_aux_loss
+        return logits
     
 # --------------------------- Checkpoint I/O --------------------------------
 def save_ckpt(model: nn.Module, optimizer: optim.Optimizer, step: int, ckpt_dir: pathlib.Path, meta: dict):
@@ -127,15 +124,32 @@ def load_ckpt(model: nn.Module, optimizer: optim.Optimizer, ckpt_path: pathlib.P
     return step
 
 # ----------------------------DATA LOADING-----------------------------------
-def openweb_bin_loader(path:str, block:int, batch:int):
-    """Yields MX arrays (x,y) shaped (batch, block) from mem‑mapped tokens."""
-    dtype = np.uint32 
-    tokens = np.memmap(path, dtype=dtype, mode='r')
-    N = tokens.shape[0] - (block+1)
+def bin_loader(data_path: str, label_path: str, block: int, batch: int):
+    """
+    토큰과 라벨 파일을 함께 읽어 (x, y, labels) 튜플을 반환
+    """
+    ids_dtype = np.uint32
+    labels_dtype = np.uint8
+    
+    tokens = np.memmap(data_path, dtype=ids_dtype, mode='r')
+    labels = np.memmap(label_path, dtype=labels_dtype, mode='r')
+    
+    # 토큰과 라벨의 길이가 같은지 확인
+    assert len(tokens) == len(labels), "Data and label files must have the same length"
+    
+    N = len(tokens) - (block + 1)
+    
     while True:
         ix = np.random.randint(0, N, size=batch)
-        buf = np.stack([tokens[i:i+block+1] for i in ix])
-        yield mx.array(buf[:,:block]), mx.array(buf[:,1:])
+        
+        # 입력 x: (batch, block)
+        x_buf = np.stack([tokens[i:i+block] for i in ix])
+        # 타겟 y: (batch, block)
+        y_buf = np.stack([tokens[i+1:i+block+1] for i in ix])
+        # 라벨 labels: (batch, block)
+        l_buf = np.stack([labels[i:i+block] for i in ix])
+        
+        yield mx.array(x_buf), mx.array(y_buf), mx.array(l_buf)
 
 # ------------------------------TRAIN LOOP-----------------------------------
 def build_opt(lr: float, wd: float, betas = (0.9, 0.95)):
@@ -167,10 +181,9 @@ def train(model, optimizer, steps:int, lr:float, train_iter, val_iter,
     }
 
     # 1. 컴파일된 학습 스텝 - 클리핑/업데이트는 제외합니다.
-    @partial(mx.compile, inputs=train_state, outputs=train_state["model"])
     def compiled_train_loss_and_grad(x, y):
         def loss_fn(mdl, x_in, y_in):
-            logits, _ = mdl(x_in, cmask)
+            logits = mdl(x_in, cmask)
             return mx.mean(nn.losses.cross_entropy(
                 logits.reshape(-1, logits.shape[-1]), y_in.reshape(-1), reduction="none"
             ))
@@ -180,9 +193,8 @@ def train(model, optimizer, steps:int, lr:float, train_iter, val_iter,
         return loss, grads
 
     # 2. 컴파일된 평가 스텝 - 평가 시에는 그래디언트가 필요 없으므로, loss 계산만
-    @partial(mx.compile, inputs=eval_state, outputs=eval_state["model"])
     def compiled_eval_loss(x, y):
-        logits, _ = model(x, cmask)
+        logits = model(x, cmask)
         loss = mx.mean(nn.losses.cross_entropy(
             logits.reshape(-1, logits.shape[-1]), y.reshape(-1), reduction="none"
         ))
@@ -206,7 +218,7 @@ def train(model, optimizer, steps:int, lr:float, train_iter, val_iter,
 
         for _ in range(accum):
             # 컴파일된 함수 호출
-            x, y = next(train_iter)
+            x, y, _ = next(train_iter)
             loss, grads = compiled_train_loss_and_grad(x, y)
             grad_acc = tree_map(lambda acc, new: acc + new, grad_acc, grads)
             tot_loss += loss.item()
@@ -220,7 +232,7 @@ def train(model, optimizer, steps:int, lr:float, train_iter, val_iter,
 
         # 로그 및 평가 (이전과 동일)
         if (s + 1) % eval_int == 0:
-            vx, vy = next(val_iter)
+            vx, vy, _ = next(val_iter)
             
             # 컴파일된 평가 함수를 호출합니다.
             v_loss = compiled_eval_loss(vx, vy)
@@ -246,7 +258,7 @@ def load_encoding(name: str) -> Tuple[tiktoken.Encoding, int]:
     return enc, n_vocab
 
 LLM_CONFIG: Dict[str, Dict] = {
-    "custom":      dict(num_layers=12,  num_heads=8,    embd_dim=512,   block_size=1024,   use_bias=True,   LR=5e-6),
+    "custom":      dict(num_layers=12,  num_heads=16,   embd_dim=512,   block_size=1024,   use_bias=True,   LR=5e-6),
     "nano":        dict(num_layers=4,   num_heads=4,    embd_dim=512,   block_size=1024,   use_bias=True,   LR=1e-5),
     "gpt2":        dict(num_layers=12,  num_heads=12,   embd_dim=768,   block_size=1024,   use_bias=True,   LR=1e-5),
     "gpt2-medium": dict(num_layers=24,  num_heads=16,   embd_dim=1024,  block_size=1024,   use_bias=True,   LR=1e-5),
@@ -254,7 +266,8 @@ LLM_CONFIG: Dict[str, Dict] = {
     "gpt2-xl":     dict(num_layers=48,  num_heads=25,   embd_dim=1600,  block_size=1024,   use_bias=True,   LR=1e-5),
 }
 
-# PYTHONPATH=. uv run examples/LLM/train.py --preset custom --train_steps 1000
+# PYTHONPATH=. uv run examples/LLM/train.py --preset custom --kv_heads 16 --train_steps 1000
+# PYTHONPATH=. uv run examples/LLM/train.py --preset custom --kv_heads 16 --train_steps 1000 --resume ckpt_001000.json
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -294,11 +307,14 @@ if __name__ == "__main__":
         start_step = load_ckpt(model, optimizer, pathlib.Path(args.ckpt_dir) / args.resume)
 
     if args.train_steps and args.data_dir:
-        tbin = pathlib.Path(args.data_dir)/"train.bin"; vbin = pathlib.Path(args.data_dir)/"val.bin"
-        if not (tbin.exists() and vbin.exists()):
-            sys.exit("train.bin/val.bin missing")
-        train_iter = openweb_bin_loader(str(tbin), cfg["block_size"], args.batch_size)
-        val_iter   = openweb_bin_loader(str(vbin), cfg["block_size"], args.batch_size)
+        tbin_ids = pathlib.Path(args.data_dir) / "train_ids.bin"
+        tbin_labels = pathlib.Path(args.data_dir) / "train_labels.bin"
+        vbin_ids = pathlib.Path(args.data_dir) / "val_ids.bin"
+        vbin_labels = pathlib.Path(args.data_dir) / "val_labels.bin"
+        if not all([f.exists() for f in [tbin_ids, tbin_labels, vbin_ids, vbin_labels]]):
+            sys.exit("One or more data/label .bin files are missing.")
+        train_iter = bin_loader(str(tbin_ids), str(tbin_labels), cfg["block_size"], args.batch_size)
+        val_iter = bin_loader(str(vbin_ids), str(vbin_labels), cfg["block_size"], args.batch_size)
         meta = {"preset":args.preset,"kv_heads":kv_heads,"enc":args.enc}
         train(
             model,
