@@ -8,5 +8,6 @@
 float16은 형변환이 많이 일어나 실질적으로 학습 효율이 좋지 않습니다. float8의 경우 mlx에서 지원할 예정이 아직 없으므로, 이를 염두해 두어야 합니다. [MLX 공식 문서](https://ml-explore.github.io/mlx/build/html/index.html) 에서는 기본적으로 float32 기반의 연산을 수행하며, bfloat16으로 변환하더라도 메모리 사용량이 급격하게 줄어드는 것은 아니라는 것을 기억하여야 합니다.
 
 ## 제공 예시
-[examples/LLM](https://github.com/Nipol/OpenMLXModel/tree/main/examples/LLM)
-[examples/GatelessMoELLM](https://github.com/Nipol/OpenMLXModel/tree/main/examples/GatelessMoELLM)
+- [examples/LLM](https://github.com/Nipol/OpenMLXModel/tree/main/examples/LLM)
+- [examples/GatelessMoELLM](https://github.com/Nipol/OpenMLXModel/tree/main/examples/GatelessMoELLM)
+- [examples/dLLM](https://github.com/Nipol/OpenMLXModel/tree/main/examples/dLLM)
