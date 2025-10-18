@@ -37,24 +37,7 @@ from common import (
     q_sample_coupled
 )
 
-class ParameterContainer:
-    """
-    옵티마이저가 요구하는 `parameters()`와 `update()` 메서드를 제공하는
-    간단한 컨테이너. nn.Module의 복잡한 동작을 피하고 안정성을 확보하기 위해 사용합니다.
-    """
-    def __init__(self, params_tree: dict):
-        self._params = params_tree
-
-    def parameters(self):
-        return self._params
-
-    def update(self, updates_tree: dict):
-        self._params = updates_tree
-
 class HybridMuonAdamW(optim.Optimizer):
-    """
-    공식 mlx.optimizers.Muon과 AdamW를 결합한 하이브리드 옵티마이저.
-    """
     def __init__(self, model: nn.Module, param_groups: list, total_steps: int):
         super().__init__()
         self.total_steps = total_steps
@@ -63,110 +46,74 @@ class HybridMuonAdamW(optim.Optimizer):
         
         muon_group = next((g for g in param_groups if g.get("use_muon")), None)
         adamw_group = next((g for g in param_groups if not g.get("use_muon")), None)
-        
-        if not muon_group or not adamw_group:
-            raise ValueError("param_groups must contain one group for Muon and one for AdamW.")
+        if not muon_group or not adamw_group: raise ValueError("param_groups must contain one group for Muon and one for AdamW.")
 
-        # [수정] 이제 param_groups의 params는 트리 구조를 가짐
-        self.muon_params_flat = tree_flatten(muon_group["params"])
-        self.adamw_params_flat = tree_flatten(adamw_group["params"])
+        self.muon_param_keys = [k for k, _ in tree_flatten(muon_group["params"])]
+        self.adamw_param_keys = [k for k, _ in tree_flatten(adamw_group["params"])]
         
-        self.muon_model = ParameterContainer(muon_group["params"])
-        self.adamw_model = ParameterContainer(adamw_group["params"])
-
         muon_group["initial_lr"] = muon_group.get("learning_rate", 3e-4)
-        self.muon_optimizer = optim.Muon(
-            learning_rate=muon_group["initial_lr"],
-            momentum=muon_group.get("momentum", 0.95),
-            weight_decay=muon_group.get("weight_decay", 0.01),
-            nesterov=muon_group.get("nesterov", True),
-            ns_steps=muon_group.get("ns_steps", 5)
-        )
-
+        self.muon_optimizer = optim.Muon(learning_rate=muon_group["initial_lr"], momentum=muon_group.get("momentum", 0.95), weight_decay=muon_group.get("weight_decay", 0.01), nesterov=muon_group.get("nesterov", True), ns_steps=muon_group.get("ns_steps", 5))
         adamw_group["initial_lr"] = adamw_group.get("learning_rate", 1e-5)
-        self.adamw_optimizer = optim.AdamW(
-            learning_rate=adamw_group["initial_lr"],
-            betas=adamw_group.get("betas", (0.9, 0.95)),
-            eps=adamw_group.get("eps", 1e-8),
-            weight_decay=adamw_group.get("weight_decay", 0.01)
-        )
+        self.adamw_optimizer = optim.AdamW(learning_rate=adamw_group["initial_lr"], betas=adamw_group.get("betas", (0.9, 0.95)), eps=adamw_group.get("eps", 1e-8), weight_decay=adamw_group.get("weight_decay", 0.01))
+        
         self.param_groups = [muon_group, adamw_group]
+        self._state = {"muon": self.muon_optimizer.state, "adamw": self.adamw_optimizer.state}
 
     def schedule_step(self):
         self.current_step += 1
         for group, optimizer in [(self.param_groups[0], self.muon_optimizer), (self.param_groups[1], self.adamw_optimizer)]:
             max_lr, min_lr = group["initial_lr"], group["initial_lr"] * 0.05
-            if self.total_steps <= 0 or self.warmup_steps <= 0:
-                lr = max_lr
-            elif self.current_step < self.warmup_steps:
-                lr = max_lr * self.current_step / self.warmup_steps
-            else:
-                prog = (self.current_step - self.warmup_steps) / (self.total_steps - self.warmup_steps)
-                lr = min_lr + (max_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * prog))
+            if self.total_steps <= 0 or self.warmup_steps <= 0: lr = max_lr
+            elif self.current_step < self.warmup_steps: lr = max_lr * self.current_step / self.warmup_steps
+            else: prog = (self.current_step - self.warmup_steps) / (self.total_steps - self.warmup_steps); lr = min_lr + (max_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * prog))
             optimizer.learning_rate = lr
 
     def apply_gradients(self, grads, params):
-        # [★★핵심 수정★★]
-        # optimizer.update() 대신 optimizer.apply_gradients()를 직접 호출합니다.
-        
-        # 1. 그래디언트를 그룹별 트리로 분리
-        all_grads_dict = dict(tree_flatten(grads))
-        muon_grads_tree = tree_unflatten([(k, all_grads_dict[k]) for k, _ in self.muon_params_flat])
-        adamw_grads_tree = tree_unflatten([(k, all_grads_dict[k]) for k, _ in self.adamw_params_flat])
-        
-        # 2. 각 그룹별로 파라미터 업데이트
-        # Muon 그룹
-        muon_params = self.muon_model.parameters()
-        updated_muon_params = self.muon_optimizer.apply_gradients(muon_grads_tree, muon_params)
-        self.muon_model.update(updated_muon_params)
-        
-        # AdamW 그룹
-        adamw_params = self.adamw_model.parameters()
-        updated_adamw_params = self.adamw_optimizer.apply_gradients(adamw_grads_tree, adamw_params)
-        self.adamw_model.update(updated_adamw_params)
+        params_dict = dict(tree_flatten(params))
+        grads_dict = dict(tree_flatten(grads))
 
-        # 3. 업데이트된 파라미터들을 다시 하나의 트리로 병합
-        final_params = {}
-        final_params.update(tree_flatten(self.muon_model.parameters()))
-        final_params.update(tree_flatten(self.adamw_model.parameters()))
+        muon_params_dict = {k: params_dict[k] for k in self.muon_param_keys}
+        muon_grads_dict = {k: grads_dict[k] for k in self.muon_param_keys if k in grads_dict}
+        adamw_params_dict = {k: params_dict[k] for k in self.adamw_param_keys}
+        adamw_grads_dict = {k: grads_dict[k] for k in self.adamw_param_keys if k in grads_dict}
+
+        muon_params = tree_unflatten(muon_params_dict)
+        muon_grads = tree_unflatten(muon_grads_dict)
+        adamw_params = tree_unflatten(adamw_params_dict)
+        adamw_grads = tree_unflatten(adamw_grads_dict)
         
-        # 4. 원래 모델의 파라미터 순서대로 최종 트리를 재구성하여 반환
-        final_params_flat = [(k, final_params[k]) for k, _ in tree_flatten(params)]
-        return tree_unflatten(final_params_flat)
+        updated_muon_params = self.muon_optimizer.apply_gradients(muon_grads, muon_params)
+        updated_adamw_params = self.adamw_optimizer.apply_gradients(adamw_grads, adamw_params)
+        
+        self._state["muon"], self._state["adamw"] = self.muon_optimizer.state, self.adamw_optimizer.state
+
+        # [★★★ 최종 수정됨 ★★★] `destination=dict` 대신 `dict(tree_flatten(...))` 사용
+        final_params = {}
+        final_params.update(dict(tree_flatten(updated_muon_params)))
+        final_params.update(dict(tree_flatten(updated_adamw_params)))
+        
+        return tree_unflatten(final_params)
 
     @property
-    def state(self):
-        return {"muon": self.muon_optimizer.state, "adamw": self.adamw_optimizer.state}
-
+    def state(self): return self._state
     @state.setter
     def state(self, new_state):
-        if "muon" in new_state: self.muon_optimizer.state = new_state["muon"]
-        if "adamw" in new_state: self.adamw_optimizer.state = new_state["adamw"]
+        self._state = new_state
+        if "muon" in self._state: self.muon_optimizer.state = self._state["muon"]
+        if "adamw" in self._state: self.adamw_optimizer.state = self._state["adamw"]
 
-
-def create_muon_param_groups(
-    model: nn.Module,
-    muon_config: dict,
-    adamw_config: dict,
-    exclude_names: list = ["norm", "bias"]
-):
-    """
-    [수정] 키 구조를 유지하는 부분 파라미터 트리를 반환하도록 수정
-    """
+def create_muon_param_groups(model: nn.Module, muon_config: dict, adamw_config: dict, exclude_names: list = ["norm", "bias"]):
     muon_params_flat, adamw_params_flat = [], []
-    for name, param in tree_flatten(model.parameters()):
+    for name, param in tree_flatten(model):
         is_excluded = any(ex_name in name for ex_name in exclude_names) or param.ndim < 2
         (adamw_params_flat if is_excluded else muon_params_flat).append((name, param))
-
-    print(f"--- Optimizer Grouping ---")
-    print(f"Muon group size: {len(muon_params_flat)} parameter tensors")
-    print(f"AdamW group size: {len(adamw_params_flat)} parameter tensors")
-
+        
+    print(f"--- Optimizer Grouping ---\nMuon group size: {len(muon_params_flat)} parameter tensors\nAdamW group size: {len(adamw_params_flat)} parameter tensors")
+    
     return [
-        {"params": tree_unflatten(muon_params_flat), "use_muon": True, **muon_config},
+        {"params": tree_unflatten(muon_params_flat), "use_muon": True, **muon_config}, 
         {"params": tree_unflatten(adamw_params_flat), "use_muon": False, **adamw_config}
     ]
-
 
 class Block(nn.Module):
     def __init__(self, d, nh, nkv, r, f, use_bias, dtype):
